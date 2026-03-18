@@ -1,129 +1,101 @@
-import yfinance as yf
-import pandas as pd
 import numpy as np
-from sklearn.preprocessing import MinMaxScaler
-from dataclasses import dataclass
-from typing import Tuple
-import warnings
-warnings.filterwarnings("ignore")
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
 
 
-@dataclass
-class DataConfig:
-    ticker: str = "AAPL"
-    period: str = "5y"
-    seq_len: int = 60
-    train_frac: float = 0.70
-    val_frac: float = 0.15
+class LSTMModel(nn.Module):
+    def __init__(self, input_size: int, hidden_size: int = 128,
+                 num_layers: int = 2, dropout: float = 0.2):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+        self.dropout = nn.Dropout(p=dropout)
+        self.fc = nn.Linear(hidden_size, 1)
+
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        out = self.dropout(out[:, -1, :])
+        return self.fc(out).squeeze(-1)
 
 
-TARGET_COL = "Close"
+def train_model(X_train, y_train, X_val, y_val,
+                epochs=100, batch_size=64, lr=1e-3,
+                patience=10, device="cpu"):
+
+    device = torch.device(device)
+    input_size = X_train.shape[2]
+    model = LSTMModel(input_size=input_size).to(device)
+    optimiser = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.MSELoss()
+
+    train_ds = TensorDataset(torch.tensor(X_train), torch.tensor(y_train))
+    val_ds   = TensorDataset(torch.tensor(X_val),   torch.tensor(y_val))
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=False)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False)
+
+    history = {"train_loss": [], "val_loss": []}
+    best_val, best_state, wait = float("inf"), None, 0
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        t_loss = 0.0
+        for xb, yb in train_loader:
+            xb, yb = xb.to(device), yb.to(device)
+            optimiser.zero_grad()
+            loss = criterion(model(xb), yb)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimiser.step()
+            t_loss += loss.item() * len(xb)
+        t_loss /= len(train_ds)
+
+        model.eval()
+        v_loss = 0.0
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb, yb = xb.to(device), yb.to(device)
+                v_loss += criterion(model(xb), yb).item() * len(xb)
+        v_loss /= len(val_ds)
+
+        history["train_loss"].append(t_loss)
+        history["val_loss"].append(v_loss)
+
+        if epoch % 10 == 0:
+            print(f"  Epoch {epoch:4d} | train={t_loss:.6f} | val={v_loss:.6f}")
+
+        if v_loss < best_val:
+            best_val = v_loss
+            best_state = {k: v.clone() for k, v in model.state_dict().items()}
+            wait = 0
+        else:
+            wait += 1
+            if wait >= patience:
+                print(f"[train] Early stop at epoch {epoch} (best val={best_val:.6f})")
+                break
+
+    model.load_state_dict(best_state)
+    return model, history
 
 
-def download_data(cfg: DataConfig) -> pd.DataFrame:
-    df = yf.download(cfg.ticker, period=cfg.period, auto_adjust=True, progress=False)
-    df.dropna(inplace=True)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    print(f"[data] Raw rows: {len(df)}")
-    return df
+def mc_dropout_predict(model, X, n_passes=100, device="cpu", batch_size=256):
+    device = torch.device(device)
+    model.train()
+    X_tensor = torch.tensor(X)
+    all_preds = []
 
+    with torch.no_grad():
+        for _ in range(n_passes):
+            preds = []
+            for i in range(0, len(X_tensor), batch_size):
+                xb = X_tensor[i:i + batch_size].to(device)
+                preds.append(model(xb).cpu().numpy())
+            all_preds.append(np.concatenate(preds))
 
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-
-    # RSI
-    delta = df["Close"].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(com=13, adjust=False).mean()
-    avg_loss = loss.ewm(com=13, adjust=False).mean()
-    rs = avg_gain / avg_loss
-    df["RSI_14"] = 100 - (100 / (1 + rs))
-
-    # MACD
-    ema12 = df["Close"].ewm(span=12, adjust=False).mean()
-    ema26 = df["Close"].ewm(span=26, adjust=False).mean()
-    df["MACD"] = ema12 - ema26
-    df["MACD_signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
-    df["MACD_hist"] = df["MACD"] - df["MACD_signal"]
-
-    # Bollinger Bands
-    sma20 = df["Close"].rolling(20).mean()
-    std20 = df["Close"].rolling(20).std()
-    df["BB_upper"] = sma20 + 2 * std20
-    df["BB_mid"]   = sma20
-    df["BB_lower"] = sma20 - 2 * std20
-
-    # SMA / EMA
-    df["SMA_20"] = sma20
-    df["EMA_20"] = df["Close"].ewm(span=20, adjust=False).mean()
-
-    df.dropna(inplace=True)
-    print(f"[data] After indicators: {len(df)} rows")
-    return df
-
-
-FEATURE_COLS = [
-    "Open", "High", "Low", "Close", "Volume",
-    "RSI_14", "MACD", "MACD_signal", "MACD_hist",
-    "BB_upper", "BB_mid", "BB_lower", "SMA_20", "EMA_20",
-]
-
-
-def temporal_split(df: pd.DataFrame, cfg: DataConfig):
-    n = len(df)
-    train_end = int(n * cfg.train_frac)
-    val_end   = int(n * (cfg.train_frac + cfg.val_frac))
-    train_df = df.iloc[:train_end]
-    val_df   = df.iloc[train_end:val_end]
-    test_df  = df.iloc[val_end:]
-    print(f"[data] Train: {len(train_df)} | Val: {len(val_df)} | Test: {len(test_df)}")
-    return train_df, val_df, test_df
-
-
-def build_scaler(train_df: pd.DataFrame):
-    available = [c for c in FEATURE_COLS if c in train_df.columns]
-    scaler = MinMaxScaler()
-    scaler.fit(train_df[available])
-    return scaler, available
-
-
-def make_sequences(df, scaler, available_cols, seq_len) -> Tuple[np.ndarray, np.ndarray]:
-    scaled = scaler.transform(df[available_cols])
-    target_idx = available_cols.index(TARGET_COL)
-    X, y = [], []
-    for i in range(seq_len, len(scaled)):
-        X.append(scaled[i - seq_len:i])
-        y.append(scaled[i, target_idx])
-    return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
-
-
-def inverse_close(values, scaler, available_cols):
-    target_idx = available_cols.index(TARGET_COL)
-    dummy = np.zeros((len(values), len(available_cols)), dtype=np.float32)
-    dummy[:, target_idx] = values
-    return scaler.inverse_transform(dummy)[:, target_idx]
-
-
-def load_pipeline(cfg: DataConfig):
-    df = download_data(cfg)
-    df = add_indicators(df)
-    train_df, val_df, test_df = temporal_split(df, cfg)
-    scaler, available_cols = build_scaler(train_df)
-
-    X_train, y_train = make_sequences(train_df, scaler, available_cols, cfg.seq_len)
-    X_val,   y_val   = make_sequences(val_df,   scaler, available_cols, cfg.seq_len)
-    X_test,  y_test  = make_sequences(test_df,  scaler, available_cols, cfg.seq_len)
-
-    return dict(
-        X_train=X_train, y_train=y_train,
-        X_val=X_val,     y_val=y_val,
-        X_test=X_test,   y_test=y_test,
-        test_close=test_df[TARGET_COL].values[cfg.seq_len:],
-        test_dates=test_df.index[cfg.seq_len:],
-        scaler=scaler,
-        available_cols=available_cols,
-        df=df,
-        train_df=train_df, val_df=val_df, test_df=test_df,
-    )
+    all_preds = np.stack(all_preds, axis=0)
+    return all_preds.mean(axis=0), all_preds.std(axis=0)
