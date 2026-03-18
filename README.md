@@ -1,7 +1,5 @@
 # LSTM Stock Price Prediction with Monte Carlo Dropout
 
-> 99% of LSTM stock projects on GitHub are scientifically invalid. This one isn't.
-
 Most implementations shuffle time-series data, fit scalers on the full dataset, and call it "deep learning." This project is built with engineering rigor — proper temporal splits, uncertainty quantification, and honest failure analysis.
 
 ---
