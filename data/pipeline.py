@@ -1,7 +1,6 @@
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import pandas_ta as ta
 from sklearn.preprocessing import MinMaxScaler
 from dataclasses import dataclass
 from typing import Tuple
@@ -18,13 +17,6 @@ class DataConfig:
     val_frac: float = 0.15
 
 
-FEATURE_COLS = [
-    "Open", "High", "Low", "Close", "Volume",
-    "RSI_14",
-    "MACD_12_26_9", "MACDh_12_26_9", "MACDs_12_26_9",
-    "BBL_20_2.0", "BBM_20_2.0", "BBU_20_2.0",
-    "SMA_20", "EMA_20",
-]
 TARGET_COL = "Close"
 
 
@@ -39,18 +31,47 @@ def download_data(cfg: DataConfig) -> pd.DataFrame:
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df.ta.rsi(length=14, append=True)
-    df.ta.macd(fast=12, slow=26, signal=9, append=True)
-    df.ta.bbands(length=20, std=2.0, append=True)
-    df.ta.sma(length=20, append=True)
-    df.ta.ema(length=20, append=True)
+
+    # RSI
+    delta = df["Close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(com=13, adjust=False).mean()
+    avg_loss = loss.ewm(com=13, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    df["RSI_14"] = 100 - (100 / (1 + rs))
+
+    # MACD
+    ema12 = df["Close"].ewm(span=12, adjust=False).mean()
+    ema26 = df["Close"].ewm(span=26, adjust=False).mean()
+    df["MACD"] = ema12 - ema26
+    df["MACD_signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
+    df["MACD_hist"] = df["MACD"] - df["MACD_signal"]
+
+    # Bollinger Bands
+    sma20 = df["Close"].rolling(20).mean()
+    std20 = df["Close"].rolling(20).std()
+    df["BB_upper"] = sma20 + 2 * std20
+    df["BB_mid"]   = sma20
+    df["BB_lower"] = sma20 - 2 * std20
+
+    # SMA / EMA
+    df["SMA_20"] = sma20
+    df["EMA_20"] = df["Close"].ewm(span=20, adjust=False).mean()
+
     df.dropna(inplace=True)
     print(f"[data] After indicators: {len(df)} rows")
     return df
 
 
+FEATURE_COLS = [
+    "Open", "High", "Low", "Close", "Volume",
+    "RSI_14", "MACD", "MACD_signal", "MACD_hist",
+    "BB_upper", "BB_mid", "BB_lower", "SMA_20", "EMA_20",
+]
+
+
 def temporal_split(df: pd.DataFrame, cfg: DataConfig):
-    """Hard cutoff — NO shuffling, NO leakage."""
     n = len(df)
     train_end = int(n * cfg.train_frac)
     val_end   = int(n * (cfg.train_frac + cfg.val_frac))
@@ -62,7 +83,6 @@ def temporal_split(df: pd.DataFrame, cfg: DataConfig):
 
 
 def build_scaler(train_df: pd.DataFrame):
-    """Fit ONLY on train. Never touch val/test before transform."""
     available = [c for c in FEATURE_COLS if c in train_df.columns]
     scaler = MinMaxScaler()
     scaler.fit(train_df[available])
@@ -87,10 +107,10 @@ def inverse_close(values, scaler, available_cols):
 
 
 def load_pipeline(cfg: DataConfig):
-    df       = download_data(cfg)
-    df       = add_indicators(df)
+    df = download_data(cfg)
+    df = add_indicators(df)
     train_df, val_df, test_df = temporal_split(df, cfg)
-    scaler, available_cols    = build_scaler(train_df)
+    scaler, available_cols = build_scaler(train_df)
 
     X_train, y_train = make_sequences(train_df, scaler, available_cols, cfg.seq_len)
     X_val,   y_val   = make_sequences(val_df,   scaler, available_cols, cfg.seq_len)
